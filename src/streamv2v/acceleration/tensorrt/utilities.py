@@ -246,21 +246,56 @@ class Engine:
             self.context = self.engine.create_execution_context()
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
-        for idx in range(trt_util.get_bindings_per_profile(self.engine)):
-            binding = self.engine[idx]
-            if shape_dict and binding in shape_dict:
-                shape = shape_dict[binding]
+        # Check if we need to reallocate (shapes changed)
+        need_realloc = False
+        if not hasattr(self, '_last_shape_dict') or self._last_shape_dict != shape_dict:
+            need_realloc = True
+            self._last_shape_dict = shape_dict.copy() if shape_dict else None
+        
+        if not need_realloc and hasattr(self, 'tensors') and self.tensors:
+            # Buffers already allocated with same shapes, just update input shapes in context
+            if shape_dict:
+                for i in range(self.engine.num_io_tensors):
+                    name = self.engine.get_tensor_name(i)
+                    if name in shape_dict and self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                        if self.context:
+                            self.context.set_input_shape(name, shape_dict[name])
+            return
+        
+        # Allocate new buffers only when needed
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if shape_dict and name in shape_dict:
+                shape = shape_dict[name]
             else:
-                shape = self.engine.get_binding_shape(binding)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            if self.engine.binding_is_input(binding):
-                self.context.set_binding_shape(idx, shape)
+                shape = self.engine.get_tensor_shape(name)
+            
+            # Handle dynamic shapes - use context to get actual shape if needed
+            if -1 in shape:
+                if self.context:
+                    shape = self.context.get_tensor_shape(name)
+                else:
+                    # Fallback: replace -1 with 1 for allocation
+                    shape = tuple(1 if dim == -1 else dim for dim in shape)
+            
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            
+            # Set input tensor shapes in context
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                if self.context:
+                    self.context.set_input_shape(name, shape)
+            
             tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]).to(device=device)
-            self.tensors[binding] = tensor
+            self.tensors[name] = tensor
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
+        # Optimize: only copy if tensor addresses are different (avoid unnecessary copies)
         for name, buf in feed_dict.items():
-            self.tensors[name].copy_(buf)
+            if self.tensors[name].data_ptr() != buf.data_ptr():
+                self.tensors[name].copy_(buf, non_blocking=True)
+            else:
+                # If same tensor, just update the address (no copy needed)
+                self.tensors[name] = buf
 
         for name, tensor in self.tensors.items():
             self.context.set_tensor_address(name, tensor.data_ptr())
@@ -274,6 +309,8 @@ class Engine:
                 noerror = self.context.execute_async_v3(stream.ptr)
                 if not noerror:
                     raise ValueError("ERROR: inference failed.")
+                # Synchronize before capture
+                CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
                 # capture cuda graph
                 CUASSERT(
                     cudart.cudaStreamBeginCapture(stream.ptr, cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal)
@@ -285,6 +322,8 @@ class Engine:
             noerror = self.context.execute_async_v3(stream.ptr)
             if not noerror:
                 raise ValueError("ERROR: inference failed.")
+            # CRITICAL: Synchronize stream to ensure computation completes before returning
+            CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
 
         return self.tensors
 
@@ -417,12 +456,12 @@ def export_onnx(
             model,
             inputs,
             onnx_path,
-            export_params=True,
             opset_version=onnx_opset,
             do_constant_folding=True,
             input_names=model_data.get_input_names(),
             output_names=model_data.get_output_names(),
             dynamic_axes=model_data.get_dynamic_axes(),
+            dynamo = False,
         )
     del model
     gc.collect()

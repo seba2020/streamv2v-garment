@@ -2,6 +2,7 @@ import gc
 import os
 from pathlib import Path
 import traceback
+import logging
 from typing import List, Literal, Optional, Union, Dict
 
 import numpy as np
@@ -12,8 +13,8 @@ from PIL import Image
 
 from streamv2v import StreamV2V
 from streamv2v.image_utils import postprocess_image
-from streamv2v.models.attention_processor import CachedSTXFormersAttnProcessor, CachedSTAttnProcessor2_0
-
+from streamv2v.acceleration.tensorrt import UNet2DConditionModelV2V
+from streamv2v.models.attention_processor import CachedSTXFormersAttnProcessor, CachedSTAttnProcessor2_0, CachedSTAttnProcessorTRT2_0
 
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -398,6 +399,8 @@ class StreamV2VWrapper:
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
         seed: int = 2,
         engine_dir: Optional[Union[str, Path]] = "engines",
+        min_cache_maxframes: int = 1,
+        max_cache_maxframes: int = 4,
     ) -> StreamV2V:
         """
         Loads the model.
@@ -483,6 +486,7 @@ class StreamV2VWrapper:
             frame_buffer_size=self.frame_buffer_size,
             use_denoising_batch=self.use_denoising_batch,
             cfg_type=cfg_type,
+            cache_maxframes=self.cache_maxframes,
         )
         if not self.sd_turbo:
             if use_lcm_lora:
@@ -510,7 +514,30 @@ class StreamV2VWrapper:
                     device=pipe.device, dtype=pipe.dtype
                 )
 
+        if self.use_cached_attn:
+            from streamv2v.models.utils import create_kvo_cache
+            kvo_cache, kvo_cache_structure = create_kvo_cache(stream.unet, batch_size=self.batch_size, cache_maxframes=self.cache_maxframes, height=self.height, width=self.width, device=self.device, dtype=self.dtype)
+            stream.unet = UNet2DConditionModelV2V(stream.unet, kvo_cache_structure=kvo_cache_structure)
+
         try:
+            if acceleration == "none":
+                if self.use_cached_attn:
+                    attn_processors = stream.pipe.unet.attn_processors
+                    new_attn_processors = {}
+                    for key, attn_processor in attn_processors.items():
+                        assert isinstance(attn_processor, AttnProcessor2_0), \
+                              "We only replace 'AttentionProcessor' to 'CachedSTAttentionProcessor'"
+                        new_attn_processors[key] = CachedSTAttnProcessor2_0(name=key,
+                                                                            use_feature_injection=self.use_feature_injection,
+                                                                            feature_injection_strength=self.feature_injection_strength,
+                                                                            feature_similarity_threshold=self.feature_similarity_threshold,
+                                                                            interval=self.cache_interval, 
+                                                                            max_frames=self.cache_maxframes,
+                                                                            use_tome_cache=self.use_tome_cache,
+                                                                            tome_metric=self.tome_metric,
+                                                                            tome_ratio=self.tome_ratio,
+                                                                            use_grid=self.use_grid)
+                    stream.pipe.unet.set_attn_processor(new_attn_processors)
             if acceleration == "xformers":
                 stream.pipe.enable_xformers_memory_efficient_attention()
                 if self.use_cached_attn:
@@ -533,26 +560,16 @@ class StreamV2VWrapper:
 
             if acceleration == "tensorrt":
                 if self.use_cached_attn:
-                    raise NotImplementedError("TensorRT seems not support the costom attention_processor")
-                else:
-                    stream.pipe.enable_xformers_memory_efficient_attention()
-                    if self.use_cached_attn:
-                        attn_processors = stream.pipe.unet.attn_processors
-                        new_attn_processors = {}
-                        for key, attn_processor in attn_processors.items():
-                            assert isinstance(attn_processor, XFormersAttnProcessor), \
-                                "We only replace 'XFormersAttnProcessor' to 'CachedSTXFormersAttnProcessor'"
-                            new_attn_processors[key] = CachedSTXFormersAttnProcessor(name=key,
-                                                                                    use_feature_injection=self.use_feature_injection,
-                                                                                    feature_injection_strength=self.feature_injection_strength,
-                                                                                    feature_similarity_threshold=self.feature_similarity_threshold,
-                                                                                    interval=self.cache_interval, 
-                                                                                    max_frames=self.cache_maxframes,
-                                                                                    use_tome_cache=self.use_tome_cache,
-                                                                                    tome_metric=self.tome_metric,
-                                                                                    tome_ratio=self.tome_ratio,
-                                                                                    use_grid=self.use_grid)
-                        stream.pipe.unet.set_attn_processor(new_attn_processors)
+                    logging.info("NOTE: tome_cache and feature injection are not supported for TensorRT acceleration with cached attention for now.")
+                    stream.kvo_cache = kvo_cache
+                    attn_processors = stream.pipe.unet.attn_processors
+                    new_attn_processors = {}
+                    for key, attn_processor in attn_processors.items():
+                        assert isinstance(attn_processor, AttnProcessor2_0), \
+                              "We only replace 'AttentionProcessor' to 'CachedSTAttentionProcessor'"
+                        new_attn_processors[key] = CachedSTAttnProcessorTRT2_0()
+                    stream.pipe.unet.set_attn_processor(new_attn_processors)
+                
 
                 from polygraphy import cuda
                 from streamv2v.acceleration.tensorrt import (
@@ -575,12 +592,19 @@ class StreamV2VWrapper:
                     model_id_or_path: str,
                     max_batch_size: int,
                     min_batch_size: int,
+                    use_cached_attn: Optional[bool] = None,
+                    min_cache_maxframes: Optional[int] = None,
+                    max_cache_maxframes: Optional[int] = None,
                 ):
                     maybe_path = Path(model_id_or_path)
                     if maybe_path.exists():
-                        return f"{maybe_path.stem}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}--max_batch-{max_batch_size}--min_batch-{min_batch_size}--cache--{self.use_cached_attn}--mode-{self.mode}"
+                        model_id_or_path = maybe_path.stem
+                        
+                    if use_cached_attn is not None:
+                        cache_str = f"--cache--{use_cached_attn}--min_cache_maxframes-{min_cache_maxframes}--max_cache_maxframes-{max_cache_maxframes}"
                     else:
-                        return f"{model_id_or_path}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}--max_batch-{max_batch_size}--min_batch-{min_batch_size}--cache--{self.use_cached_attn}--mode-{self.mode}"
+                        cache_str = ""
+                    return f"{model_id_or_path}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}--max_batch-{max_batch_size}--min_batch-{min_batch_size}{cache_str}--mode-{self.mode}"
 
                 engine_dir = Path(engine_dir)
                 unet_path = os.path.join(
@@ -589,6 +613,9 @@ class StreamV2VWrapper:
                         model_id_or_path=model_id_or_path,
                         max_batch_size=stream.trt_unet_batch_size,
                         min_batch_size=stream.trt_unet_batch_size,
+                        use_cached_attn=self.use_cached_attn,
+                        min_cache_maxframes=self.cache_maxframes,
+                        max_cache_maxframes=self.cache_maxframes,
                     ),
                     "unet.engine",
                 )
@@ -614,12 +641,18 @@ class StreamV2VWrapper:
                 if not os.path.exists(unet_path):
                     os.makedirs(os.path.dirname(unet_path), exist_ok=True)
                     unet_model = UNet(
+                        stream.unet.unet,
                         fp16=True,
                         device=stream.device,
                         max_batch_size=stream.trt_unet_batch_size,
                         min_batch_size=stream.trt_unet_batch_size,
                         embedding_dim=stream.text_encoder.config.hidden_size,
-                        unet_dim=stream.unet.config.in_channels,
+                        unet_dim=stream.unet.unet.config.in_channels,
+                        height=self.height,
+                        width=self.width,
+                        min_cache_maxframes=min_cache_maxframes,
+                        max_cache_maxframes=max_cache_maxframes,
+                        cache_maxframes=self.cache_maxframes,
                     )
                     compile_unet(
                         stream.unet,
@@ -665,20 +698,20 @@ class StreamV2VWrapper:
                         opt_batch_size=stream.frame_bff_size,
                     )
 
-                cuda_steram = cuda.Stream()
+                cuda_stream = cuda.Stream()
 
                 vae_config = stream.vae.config
                 vae_dtype = stream.vae.dtype
 
                 stream.unet = UNet2DConditionModelEngine(
-                    unet_path, cuda_steram, use_cuda_graph=False
+                    unet_path, cuda_stream, use_cuda_graph=True
                 )
                 stream.vae = AutoencoderKLEngine(
                     vae_encoder_path,
                     vae_decoder_path,
-                    cuda_steram,
+                    cuda_stream,
                     stream.pipe.vae_scale_factor,
-                    use_cuda_graph=False,
+                    use_cuda_graph=True,
                 )
                 setattr(stream.vae, "config", vae_config)
                 setattr(stream.vae, "dtype", vae_dtype)

@@ -7,7 +7,7 @@ from setuptools import find_packages, setup
 _deps = [
     "torch",
     "xformers",
-    "diffusers==0.27.0",
+    "diffusers @ git+https://github.com/varshith15/diffusers.git@3e3b72f557e91546894340edabc845e894f00922",
     "transformers",
     "accelerate",
     "fire",
@@ -21,7 +21,7 @@ _deps = [
     # "pywin32;sys_platform == 'win32'"
 ]
 
-deps = {b: a for a, b in (re.findall(r"^(([^!=<>~]+)(?:[!=<>~].*)?$)", x)[0] for x in _deps)}
+deps = {b: a for a, b in (re.findall(r"^(([^!=<>~@\s]+)(?:[\s@!=<>~].*)?$)", x)[0] for x in _deps)}
 
 
 def deps_list(*pkgs):
@@ -31,7 +31,7 @@ def deps_list(*pkgs):
 extras = {}
 extras["xformers"] = deps_list("xformers")
 extras["torch"] = deps_list("torch", "accelerate")
-extras["tensorrt"] = deps_list("protobuf", "cuda-python", "onnx", "onnxruntime", "colored")
+extras["tensorrt"] = deps_list("protobuf", "cuda-python", "onnx", "onnxruntime", "colored", "polygraphy", "onnx-graphsurgeon", "tensorrt==10.9.0.34")
 
 extras["dev"] = extras["xformers"] + extras["torch"] + extras["tensorrt"]
 

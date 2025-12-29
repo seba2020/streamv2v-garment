@@ -21,6 +21,9 @@ import onnx_graphsurgeon as gs
 import torch
 from onnx import shape_inference
 from polygraphy.backend.onnx.loader import fold_constants
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+
+from streamv2v.models.utils import get_kvo_cache_info
 
 
 class Optimizer:
@@ -222,6 +225,7 @@ class CLIP(BaseModel):
 class UNet(BaseModel):
     def __init__(
         self,
+        unet: UNet2DConditionModel,
         fp16=False,
         device="cuda",
         max_batch_size=16,
@@ -229,6 +233,11 @@ class UNet(BaseModel):
         embedding_dim=768,
         text_maxlen=77,
         unet_dim=4,
+        cache_maxframes=1,
+        min_cache_maxframes=1,
+        max_cache_maxframes=4,
+        height=512,
+        width=512,
     ):
         super(UNet, self).__init__(
             fp16=fp16,
@@ -240,20 +249,43 @@ class UNet(BaseModel):
         )
         self.unet_dim = unet_dim
         self.name = "UNet"
-
+        self.unet = unet
+        self.min_cache_maxframes = min_cache_maxframes
+        self.max_cache_maxframes = max_cache_maxframes
+        self.cache_maxframes = cache_maxframes
+        self.height = height
+        self.width = width
+        self.kvo_cache_shapes, self.kvo_cache_structure, self.kvo_cache_count = get_kvo_cache_info(unet, height, width)
+    
     def get_input_names(self):
-        return ["sample", "timestep", "encoder_hidden_states"]
+        return ["sample", "timestep", "encoder_hidden_states"] + self.get_kvo_cache_names("in")
 
     def get_output_names(self):
-        return ["latent"]
+        return ["latent"] + self.get_kvo_cache_names("out")
+
+    def get_kvo_cache_names(self, in_out: str):
+        return [f"kvo_cache_{in_out}_{idx}" for idx in range(self.kvo_cache_count)]
+
+    def get_kvo_cache_input_profile(self, min_batch, batch_size, max_batch):
+        profiles = []
+        for shape in self.kvo_cache_shapes:
+            profile = [(2, self.min_cache_maxframes, min_batch, shape[0], shape[1]), (2, self.cache_maxframes, batch_size, shape[0], shape[1]), (2, self.max_cache_maxframes, max_batch, shape[0], shape[1])]
+            profiles.append(profile)
+        return profiles
 
     def get_dynamic_axes(self):
-        return {
+        base_axes = {
             "sample": {0: "2B", 2: "H", 3: "W"},
             "timestep": {0: "2B"},
             "encoder_hidden_states": {0: "2B"},
             "latent": {0: "2B", 2: "H", 3: "W"},
         }
+        
+        for i in range(self.kvo_cache_count):
+            base_axes[f"kvo_cache_in_{i}"] = {1: "C", 2: "2B"}
+            base_axes[f"kvo_cache_out_{i}"] = {2: "2B"}
+        
+        return base_axes
 
     def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
@@ -281,16 +313,23 @@ class UNet(BaseModel):
                 (batch_size, self.text_maxlen, self.embedding_dim),
                 (max_batch, self.text_maxlen, self.embedding_dim),
             ],
+            **{name: profile for name, profile in zip(self.get_kvo_cache_names("in"), self.get_kvo_cache_input_profile(min_batch, batch_size, max_batch))},
         }
 
     def get_shape_dict(self, batch_size, image_height, image_width):
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
-        return {
+        shape_dict = {
             "sample": (2 * batch_size, self.unet_dim, latent_height, latent_width),
             "timestep": (2 * batch_size,),
             "encoder_hidden_states": (2 * batch_size, self.text_maxlen, self.embedding_dim),
             "latent": (2 * batch_size, 4, latent_height, latent_width),
         }
+        
+        for in_name, out_name, shape in zip(self.get_kvo_cache_names("in"), self.get_kvo_cache_names("out"), self.kvo_cache_shapes):
+            shape_dict[in_name] = (2, self.cache_maxframes, batch_size, shape[0], shape[1])
+            shape_dict[out_name] = (2, 1, batch_size, shape[0], shape[1])
+        
+        return shape_dict
 
     def get_sample_input(self, batch_size, image_height, image_width):
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
@@ -301,6 +340,7 @@ class UNet(BaseModel):
             ),
             torch.ones((2 * batch_size,), dtype=torch.float32, device=self.device),
             torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
+            *[torch.randn(2, self.cache_maxframes, 2 * batch_size, shape[0], shape[1], dtype=torch.float16).to(self.device) for shape in self.kvo_cache_shapes],
         )
 
 

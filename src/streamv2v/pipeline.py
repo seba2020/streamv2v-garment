@@ -8,7 +8,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
-from torchvision.models.optical_flow import raft_small
 
 from diffusers import LCMScheduler, StableDiffusionPipeline
 from diffusers.image_processor import VaeImageProcessor
@@ -32,6 +31,9 @@ class StreamV2V:
         use_denoising_batch: bool = True,
         frame_buffer_size: int = 1,
         cfg_type: Literal["none", "full", "self", "initialize"] = "self",
+        kvo_cache: List[torch.Tensor] = [],
+        cache_interval: int = 1,
+        cache_maxframes: int = 1,
     ) -> None:
         self.device = pipe.device
         self.dtype = torch_dtype
@@ -86,6 +88,11 @@ class StreamV2V:
         self.cached_x_t_latent = deque(maxlen=4)
 
         self.inference_time_ema = 0
+
+        self.kvo_cache = kvo_cache
+        self.cache_interval = cache_interval
+        self.cache_maxframes = cache_maxframes
+        self.frame_idx = 0
 
     def load_lcm_lora(
         self,
@@ -326,12 +333,14 @@ class StreamV2V:
         else:
             x_t_latent_plus_uc = x_t_latent
 
-        model_pred = self.unet(
+        model_pred, kvo_cache_out = self.unet(
             x_t_latent_plus_uc,
             t_list,
-            encoder_hidden_states=self.prompt_embeds,
-            return_dict=False,
-        )[0]
+            self.prompt_embeds,
+            *self.kvo_cache,
+        )
+        
+        self.update_kvo_cache(kvo_cache_out)
 
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
@@ -386,6 +395,18 @@ class StreamV2V:
 
         return denoised_batch, model_pred
 
+    def update_kvo_cache(self, kvo_cache_out: List[torch.Tensor]) -> None:
+        if not self.kvo_cache:
+            return
+
+        self.frame_idx += 1
+        if self.frame_idx % self.cache_interval != 0:
+            return
+
+        for i, new_kv in enumerate(kvo_cache_out):
+            if self.kvo_cache[i].shape[1] > 1:
+                self.kvo_cache[i] = torch.roll(self.kvo_cache[i], shifts=-1, dims=1)
+            self.kvo_cache[i][:, -1] = new_kv.squeeze(1)
 
     def norm_noise(self, noise):
         # Compute mean and std of blended_noise

@@ -2,6 +2,7 @@ import gc
 import os
 
 import torch
+from typing import List
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
     retrieve_latents,
@@ -12,6 +13,20 @@ from ...pipeline import StreamV2V
 from .builder import EngineBuilder, create_onnx_path
 from .engine import AutoencoderKLEngine, UNet2DConditionModelEngine
 from .models import VAE, BaseModel, UNet, VAEEncoder
+from ...models.utils import convert_structure_to_list, convert_list_to_structure
+
+class UNet2DConditionModelV2V(torch.nn.Module):
+    def __init__(self, unet: UNet2DConditionModel, kvo_cache_structure = []):
+        super().__init__()
+        self.unet = unet
+        self.kvo_cache_structure = kvo_cache_structure
+
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor, *kvo_cache):
+        kvo_cache = list(kvo_cache)
+        formatted_cache = convert_list_to_structure(kvo_cache, self.kvo_cache_structure)
+        model_pred, formatted_cache_out = self.unet(x, timestep, encoder_hidden_states, kvo_cache=formatted_cache, return_dict=False)
+        kvo_cache_out = convert_structure_to_list(formatted_cache_out)
+        return model_pred, kvo_cache_out
 
 
 class TorchVAEEncoder(torch.nn.Module):

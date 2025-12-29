@@ -16,23 +16,24 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def main(
-    input: str,
-    prompt: str,
+    input: str = "temporal_test.mp4",
+    prompt: str = "Anime girl",
     output_dir: str = os.path.join(CURRENT_DIR, "outputs"),
     model_id: str = "Jiali/stable-diffusion-1.5",
     scale: float = 1.0,
     guidance_scale: float = 1.0,
-    diffusion_steps: int = 4,
+    diffusion_steps: int = 1,
     noise_strength: float = 0.4,
-    acceleration: Literal["none", "xformers", "tensorrt"] = "xformers",
+    acceleration: Literal["none", "xformers", "tensorrt"] = "tensorrt",
+    dtype: Literal["float16", "bfloat16", "float32"] = "float16",
     use_denoising_batch: bool = True,
     use_cached_attn: bool = True,
     use_feature_injection: bool = True,
-    feature_injection_strength: float = 0.8,
-    feature_similarity_threshold: float = 0.98,
-    cache_interval: int = 4,
-    cache_maxframes: int = 1,
-    use_tome_cache: bool = True,
+    feature_injection_strength: float = 0.95,
+    feature_similarity_threshold: float = 0.95,
+    cache_interval: int = 1,
+    cache_maxframes: int = 4,
+    use_tome_cache: bool = False,
     do_add_noise: bool = True,
     enable_similar_image_filter: bool = False,
     seed: int = 2,
@@ -67,6 +68,10 @@ def main(
     acceleration: Literal["none", "xformers", "tensorrt"] = "xformers"
         The type of acceleration to use for video translation. 
         By default, it is xformers.
+    dtype: Literal["float16", "bfloat16", "float32"], optional
+        The data type for model inference. 
+        For xformers acceleration on newer GPUs, use float16 or bfloat16.
+        By default, it is float16.
     use_denoising_batch: bool, optional
         Whether to use denoising batch or not.
         By default, it is True.
@@ -110,6 +115,13 @@ def main(
     interval = int(50 * noise_strength) // diffusion_steps
     t_index_list = [init_step + i * interval for i in range(diffusion_steps)]
 
+    # Convert dtype string to torch dtype
+    if dtype == "float16":
+        torch_dtype = torch.float16
+    elif dtype == "bfloat16":
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = torch.float32
 
     stream = StreamV2VWrapper(
         model_id_or_path=model_id,
@@ -120,6 +132,7 @@ def main(
         height=height,
         warmup=10,
         acceleration=acceleration,
+        dtype=torch_dtype,
         do_add_noise=do_add_noise,
         output_type="pt",
         enable_similar_image_filter=enable_similar_image_filter,
