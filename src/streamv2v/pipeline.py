@@ -94,6 +94,14 @@ class StreamV2V:
         self.cache_maxframes = cache_maxframes
         self.frame_idx = 0
 
+        # Masked latent blending: keeps regions outside `blend_mask` locked to
+        # the source frame (e.g. everything but the segmented clothing),
+        # while the mask region is left free for the model (and IP-Adapter)
+        # to regenerate. See set_blend_mask().
+        self.use_mask_blending = False
+        self.blend_mask: Optional[torch.Tensor] = None
+        self._clean_source_latent: Optional[torch.Tensor] = None
+
     def load_lcm_lora(
         self,
         pretrained_model_name_or_path_or_dict: Union[
@@ -417,15 +425,42 @@ class StreamV2V:
         normalized_noise = (noise - mean) / std
         return normalized_noise
         
-    def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:        
+    def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
         image_tensors = image_tensors.to(
             device=self.device,
             dtype=self.vae.dtype,
         )
         img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
         img_latent = img_latent * self.vae.config.scaling_factor
+        self._clean_source_latent = img_latent.to(dtype=self.dtype)
         x_t_latent = self.add_noise(img_latent, self.init_noise[0], 0)
         return x_t_latent
+
+    def set_blend_mask(self, mask: Optional[torch.Tensor]) -> None:
+        """`mask` is a [1, 1, latent_height, latent_width] tensor in [0, 1]:
+        1 = free for the model to regenerate, 0 = locked to the source frame.
+        Pass None to disable blending for subsequent frames.
+        """
+        if mask is None:
+            self.blend_mask = None
+            return
+        assert self.frame_bff_size == 1, "Masked latent blending currently assumes frame_buffer_size == 1."
+        self.blend_mask = mask.to(device=self.device, dtype=self.dtype)
+
+    def _blend_latent_with_source(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.use_mask_blending or self.blend_mask is None or self._clean_source_latent is None:
+            return latent
+        return self.blend_mask * latent + (1 - self.blend_mask) * self._clean_source_latent
+
+    def _blend_buffer_with_source(self, buffer: torch.Tensor) -> torch.Tensor:
+        if not self.use_mask_blending or self.blend_mask is None or self._clean_source_latent is None:
+            return buffer
+        num_steps = buffer.shape[0]
+        source_noised = (
+            self.alpha_prod_t_sqrt[1 : 1 + num_steps] * self._clean_source_latent
+            + self.beta_prod_t_sqrt[1 : 1 + num_steps] * self.init_noise[1 : 1 + num_steps]
+        )
+        return self.blend_mask * buffer + (1 - self.blend_mask) * source_noised
 
     def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
         output_latent = self.vae.decode(
@@ -446,17 +481,19 @@ class StreamV2V:
 
             if self.denoising_steps_num > 1:
                 x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
+                x_0_pred_out = self._blend_latent_with_source(x_0_pred_out)
                 if self.do_add_noise:
-                    self.x_t_latent_buffer = (
+                    next_buffer = (
                         self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
                         + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
                     )
                 else:
-                    self.x_t_latent_buffer = (
+                    next_buffer = (
                         self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
                     )
+                self.x_t_latent_buffer = self._blend_buffer_with_source(next_buffer)
             else:
-                x_0_pred_out = x_0_pred_batch
+                x_0_pred_out = self._blend_latent_with_source(x_0_pred_batch)
                 self.x_t_latent_buffer = None
         else:
             self.init_noise = x_t_latent

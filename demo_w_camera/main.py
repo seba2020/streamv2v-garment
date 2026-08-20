@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -101,6 +101,17 @@ class App:
             except Exception as e:
                 logging.error(f"Websocket Error: {e}, {user_id} ")
                 await self.conn_manager.disconnect(user_id)
+
+        @self.app.post("/api/garment_image")
+        async def set_garment_image(file: UploadFile = File(...)):
+            if not self.args.garment_mode:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Server was not started with --garment-mode.",
+                )
+            image = bytes_to_pil(await file.read())
+            self.pipeline.set_garment_image(image)
+            return JSONResponse({"status": "ok"})
 
         @self.app.get("/api/queue")
         async def get_queue_size():

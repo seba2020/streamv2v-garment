@@ -13,6 +13,7 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.models.lora import LoRACompatibleLinear, LoRALinearLayer
 
 from .utils import get_nn_feats, random_bipartite_soft_matching
+from .ip_adapter import IPAdapterAttnWeights, IPAdapterState
 
 if is_xformers_available():
     import xformers
@@ -30,10 +31,13 @@ class CachedSTAttnProcessor2_0:
                  feature_similarity_threshold=0.98,
                  interval=4, 
                  max_frames=1, 
-                 use_tome_cache=False, 
-                 tome_metric="keys", 
-                 use_grid=False, 
-                 tome_ratio=0.5):
+                 use_tome_cache=False,
+                 tome_metric="keys",
+                 use_grid=False,
+                 tome_ratio=0.5,
+                 ip_adapter_weights: Optional[IPAdapterAttnWeights] = None,
+                 ip_adapter_scale: float = 0.0,
+                 ip_adapter_state: Optional[IPAdapterState] = None):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         self.name = name
@@ -51,6 +55,9 @@ class CachedSTAttnProcessor2_0:
         self.tome_metric = tome_metric
         self.use_grid = use_grid
         self.tome_ratio = tome_ratio
+        self.ip_adapter_weights = ip_adapter_weights
+        self.ip_adapter_scale = ip_adapter_scale
+        self.ip_adapter_state = ip_adapter_state
     
     def _tome_step_kvout(self, keys, values, outputs):
         keys = torch.cat([self.cached_key, keys], dim=1)
@@ -137,6 +144,20 @@ class CachedSTAttnProcessor2_0:
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
+
+        if not is_selfattn and self.ip_adapter_weights is not None and self.ip_adapter_state is not None:
+            ip_hidden_states = self.ip_adapter_state.get(batch_size)
+            if ip_hidden_states is not None:
+                ip_hidden_states = ip_hidden_states.to(device=query.device, dtype=query.dtype)
+                ip_key = self.ip_adapter_weights.to_k_ip(ip_hidden_states)
+                ip_value = self.ip_adapter_weights.to_v_ip(ip_hidden_states)
+                ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                ip_hidden_states = F.scaled_dot_product_attention(
+                    query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
+                )
+                ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+                hidden_states = hidden_states + self.ip_adapter_scale * ip_hidden_states.to(query.dtype)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states, *args)
@@ -288,9 +309,12 @@ class CachedSTXFormersAttnProcessor:
             operator.
     """
 
-    def __init__(self, attention_op: Optional[Callable] = None, name=None, 
+    def __init__(self, attention_op: Optional[Callable] = None, name=None,
                  use_feature_injection=False, feature_injection_strength=0.8, feature_similarity_threshold=0.98,
-                 interval=4, max_frames=4, use_tome_cache=False, tome_metric="keys", use_grid=False, tome_ratio=0.5):
+                 interval=4, max_frames=4, use_tome_cache=False, tome_metric="keys", use_grid=False, tome_ratio=0.5,
+                 ip_adapter_weights: Optional[IPAdapterAttnWeights] = None,
+                 ip_adapter_scale: float = 0.0,
+                 ip_adapter_state: Optional[IPAdapterState] = None):
         self.attention_op = attention_op
         self.name = name
         self.use_feature_injection = use_feature_injection
@@ -305,6 +329,9 @@ class CachedSTXFormersAttnProcessor:
         self.tome_metric = tome_metric
         self.use_grid = use_grid
         self.tome_ratio = tome_ratio
+        self.ip_adapter_weights = ip_adapter_weights
+        self.ip_adapter_scale = ip_adapter_scale
+        self.ip_adapter_state = ip_adapter_state
 
     def _tome_step_kvout(self, keys, values, outputs):
         if len(self.cached_value) == 1:
@@ -424,6 +451,18 @@ class CachedSTXFormersAttnProcessor:
             query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
         )
         hidden_states = hidden_states.to(query.dtype)
+
+        if not is_selfattn and self.ip_adapter_weights is not None and self.ip_adapter_state is not None:
+            ip_hidden_states = self.ip_adapter_state.get(batch_size)
+            if ip_hidden_states is not None:
+                ip_hidden_states = ip_hidden_states.to(device=query.device, dtype=query.dtype)
+                ip_key = attn.head_to_batch_dim(self.ip_adapter_weights.to_k_ip(ip_hidden_states)).contiguous()
+                ip_value = attn.head_to_batch_dim(self.ip_adapter_weights.to_v_ip(ip_hidden_states)).contiguous()
+                ip_out = xformers.ops.memory_efficient_attention(
+                    query, ip_key, ip_value, attn_bias=None, op=self.attention_op, scale=attn.scale
+                )
+                hidden_states = hidden_states + self.ip_adapter_scale * ip_out.to(query.dtype)
+
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj

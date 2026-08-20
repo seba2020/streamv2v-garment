@@ -15,6 +15,8 @@ from streamv2v import StreamV2V
 from streamv2v.image_utils import postprocess_image
 from streamv2v.acceleration.tensorrt import UNet2DConditionModelV2V
 from streamv2v.models.attention_processor import CachedSTXFormersAttnProcessor, CachedSTAttnProcessor2_0, CachedSTAttnProcessorTRT2_0
+from streamv2v.models.ip_adapter import IPAdapterEncoder, IPAdapterState, load_ip_adapter_sd15
+from streamv2v.models.segmentation import ClothesSegmenter, DEFAULT_GARMENT_LABELS
 
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -60,6 +62,16 @@ class StreamV2VWrapper:
         seed: int = 2,
         use_safety_checker: bool = False,
         engine_dir: Optional[Union[str, Path]] = "engines",
+        use_ip_adapter: bool = False,
+        ip_adapter_id: str = "h94/IP-Adapter",
+        ip_adapter_weight_name: str = "ip-adapter_sd15.bin",
+        ip_adapter_scale: float = 0.6,
+        use_clothes_mask: bool = False,
+        clothes_segmenter_id: str = "mattmdjaga/segformer_b2_clothes",
+        clothes_labels: Optional[List[str]] = None,
+        mask_feather_px: int = 3,
+        mask_seg_size: int = 256,
+        mask_update_interval: int = 1,
     ):
         """
         Initializes the StreamV2VWrapper.
@@ -141,6 +153,38 @@ class StreamV2VWrapper:
             Whether to use a safety checker, by default False.
         engine_dir : Optional[Union[str, Path]], optional
             The directory for the engine, by default "engines".
+        use_ip_adapter : bool, optional
+            Whether to condition generation on a reference image via
+            IP-Adapter (h94/IP-Adapter, SD1.5), by default False.
+            Only supported with acceleration in {"none", "xformers"}.
+            Set the reference image with `set_ip_adapter_image`.
+        ip_adapter_id : str, optional
+            The IP-Adapter repo id, by default "h94/IP-Adapter".
+        ip_adapter_weight_name : str, optional
+            The IP-Adapter checkpoint file name, by default "ip-adapter_sd15.bin".
+        ip_adapter_scale : float, optional
+            The strength of the IP-Adapter image conditioning, by default 0.6.
+        use_clothes_mask : bool, optional
+            Whether to segment clothing in each input frame and blend the
+            denoised latent so everything outside the clothing region stays
+            locked to the source frame, by default False.
+        clothes_segmenter_id : str, optional
+            The clothing segmentation model repo id, by default
+            "mattmdjaga/segformer_b2_clothes".
+        clothes_labels : Optional[List[str]], optional
+            Which segmentation labels count as "clothing" to regenerate, by
+            default ["upper_clothes", "skirt", "pants", "dress", "belt"].
+        mask_feather_px : int, optional
+            Blur radius (in segmentation-resolution pixels) applied to the
+            clothing mask before downsampling to latent resolution, by
+            default 3.
+        mask_seg_size : int, optional
+            Resolution the clothing segmentation model runs at; mask
+            precision beyond the latent grid is wasted, so this is the main
+            lever for its per-frame cost, by default 256.
+        mask_update_interval : int, optional
+            Only recompute the clothing mask every N calls to `img2img`,
+            reusing the previous mask otherwise, by default 1 (every frame).
         """
         # TODO: Test SD turbo
         self.sd_turbo = "turbo" in model_id_or_path
@@ -188,6 +232,35 @@ class StreamV2VWrapper:
         self.use_grid = use_grid
         self.use_safety_checker = use_safety_checker
 
+        if use_ip_adapter:
+            if self.sd_xl:
+                raise NotImplementedError("use_ip_adapter currently only supports SD1.5 models.")
+            if acceleration not in ("none", "xformers"):
+                raise NotImplementedError(
+                    f"use_ip_adapter is not supported with acceleration={acceleration!r} yet; "
+                    "use 'none' or 'xformers'."
+                )
+            if not use_cached_attn:
+                raise NotImplementedError("use_ip_adapter currently requires use_cached_attn=True.")
+        self.use_ip_adapter = use_ip_adapter
+        self.ip_adapter_id = ip_adapter_id
+        self.ip_adapter_weight_name = ip_adapter_weight_name
+        self.ip_adapter_scale = ip_adapter_scale
+        self._ip_adapter_state = IPAdapterState()
+        self._ip_adapter_encoder: Optional[IPAdapterEncoder] = None
+
+        self.use_clothes_mask = use_clothes_mask
+        self.clothes_labels = clothes_labels or DEFAULT_GARMENT_LABELS
+        self.mask_feather_px = mask_feather_px
+        self.mask_seg_size = mask_seg_size
+        self.mask_update_interval = max(1, mask_update_interval)
+        self._mask_frame_counter = 0
+        self._clothes_segmenter: Optional[ClothesSegmenter] = None
+        if use_clothes_mask:
+            self._clothes_segmenter = ClothesSegmenter(
+                model_id=clothes_segmenter_id, device=self.device, dtype=torch.float32
+            )
+
         self.stream: StreamV2V = self._load_model(
             model_id_or_path=model_id_or_path,
             lora_dict=lora_dict,
@@ -203,6 +276,7 @@ class StreamV2VWrapper:
             seed=seed,
             engine_dir=engine_dir,
         )
+        self.stream.use_mask_blending = self.use_clothes_mask
 
         if device_ids is not None:
             self.stream.unet = torch.nn.DataParallel(
@@ -325,6 +399,21 @@ class StreamV2VWrapper:
         if isinstance(image, str) or isinstance(image, Image.Image):
             image = self.preprocess_image(image)
 
+        if self.use_clothes_mask:
+            if self._mask_frame_counter % self.mask_update_interval == 0:
+                mask = self._clothes_segmenter.get_mask(
+                    self._tensor_to_pil(image),
+                    latent_height=self.stream.latent_height,
+                    latent_width=self.stream.latent_width,
+                    labels=self.clothes_labels,
+                    feather_px=self.mask_feather_px,
+                    device=self.device,
+                    dtype=self.dtype,
+                    seg_size=self.mask_seg_size,
+                )
+                self.stream.set_blend_mask(mask)
+            self._mask_frame_counter += 1
+
         image_tensor = self.stream(image)
         image = self.postprocess_image(image_tensor, output_type=self.output_type)
 
@@ -362,6 +451,23 @@ class StreamV2VWrapper:
         return self.stream.image_processor.preprocess(
             image, self.height, self.width
         ).to(device=self.device, dtype=self.dtype)
+
+    def _tensor_to_pil(self, image_tensor: torch.Tensor) -> Image.Image:
+        return self.stream.image_processor.postprocess(image_tensor, output_type="pil")[0]
+
+    def set_ip_adapter_image(self, image: Union[str, Image.Image]) -> None:
+        """
+        Sets the reference image used for IP-Adapter conditioning. Call this
+        once (or whenever the reference garment changes) rather than every
+        frame; `use_ip_adapter=True` must have been passed to the constructor.
+        """
+        if not self.use_ip_adapter:
+            raise RuntimeError(
+                "IP-Adapter is not enabled; construct StreamV2VWrapper with use_ip_adapter=True."
+            )
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        self._ip_adapter_state.hidden_states = self._ip_adapter_encoder.encode(image)
 
     def postprocess_image(
         self, image_tensor: torch.Tensor, output_type: str = "pil"
@@ -519,6 +625,23 @@ class StreamV2VWrapper:
             kvo_cache, kvo_cache_structure = create_kvo_cache(stream.unet, batch_size=self.batch_size, cache_maxframes=self.cache_maxframes, height=self.height, width=self.width, device=self.device, dtype=self.dtype)
             stream.unet = UNet2DConditionModelV2V(stream.unet, kvo_cache_structure=kvo_cache_structure)
 
+        ip_layers_by_name = {}
+        if self.use_ip_adapter:
+            image_encoder, image_processor, image_proj_model, ip_layers_by_name = load_ip_adapter_sd15(
+                stream.pipe.unet,
+                pretrained_model_name_or_path=self.ip_adapter_id,
+                weight_name=self.ip_adapter_weight_name,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._ip_adapter_encoder = IPAdapterEncoder(
+                image_encoder=image_encoder,
+                image_processor=image_processor,
+                image_proj_model=image_proj_model,
+                device=self.device,
+                dtype=self.dtype,
+            )
+
         try:
             if acceleration == "none":
                 if self.use_cached_attn:
@@ -531,12 +654,15 @@ class StreamV2VWrapper:
                                                                             use_feature_injection=self.use_feature_injection,
                                                                             feature_injection_strength=self.feature_injection_strength,
                                                                             feature_similarity_threshold=self.feature_similarity_threshold,
-                                                                            interval=self.cache_interval, 
+                                                                            interval=self.cache_interval,
                                                                             max_frames=self.cache_maxframes,
                                                                             use_tome_cache=self.use_tome_cache,
                                                                             tome_metric=self.tome_metric,
                                                                             tome_ratio=self.tome_ratio,
-                                                                            use_grid=self.use_grid)
+                                                                            use_grid=self.use_grid,
+                                                                            ip_adapter_weights=ip_layers_by_name.get(key),
+                                                                            ip_adapter_scale=self.ip_adapter_scale,
+                                                                            ip_adapter_state=self._ip_adapter_state if self.use_ip_adapter else None)
                     stream.pipe.unet.set_attn_processor(new_attn_processors)
             if acceleration == "xformers":
                 stream.pipe.enable_xformers_memory_efficient_attention()
@@ -550,12 +676,15 @@ class StreamV2VWrapper:
                                                                                  use_feature_injection=self.use_feature_injection,
                                                                                  feature_injection_strength=self.feature_injection_strength,
                                                                                  feature_similarity_threshold=self.feature_similarity_threshold,
-                                                                                 interval=self.cache_interval, 
+                                                                                 interval=self.cache_interval,
                                                                                  max_frames=self.cache_maxframes,
                                                                                  use_tome_cache=self.use_tome_cache,
                                                                                  tome_metric=self.tome_metric,
                                                                                  tome_ratio=self.tome_ratio,
-                                                                                 use_grid=self.use_grid)
+                                                                                 use_grid=self.use_grid,
+                                                                                 ip_adapter_weights=ip_layers_by_name.get(key),
+                                                                                 ip_adapter_scale=self.ip_adapter_scale,
+                                                                                 ip_adapter_state=self._ip_adapter_state if self.use_ip_adapter else None)
                     stream.pipe.unet.set_attn_processor(new_attn_processors)
 
             if acceleration == "tensorrt":

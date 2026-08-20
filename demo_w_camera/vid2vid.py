@@ -99,7 +99,10 @@ class Pipeline:
             cache_maxframes=1,
             use_tome_cache=True,
             seed=1,
+            use_ip_adapter=args.garment_mode,
+            use_clothes_mask=args.garment_mode,
         )
+        self.garment_mode = args.garment_mode
         self._init_lora()
         self.last_prompt = default_prompt
         self.stream.prepare(
@@ -115,6 +118,11 @@ class Pipeline:
                                    'crayons', 'Crayons', 'crayons doodle', 'Crayons doodle',
                                    'sketch', 'Sketch', 'pencil drawing', 'Pencil drawing',
                                    'oil painting', 'Oil painting']
+
+    def set_garment_image(self, image: Image.Image) -> None:
+        if not self.garment_mode:
+            raise RuntimeError("Server was not started with --garment-mode.")
+        self.stream.set_ip_adapter_image(image)
 
     def _init_lora(self):
         self.stream.stream.load_lora("./lora_weights/PixelArtRedmond15V-PixelArt-PIXARFK.safetensors", adapter_name='pixelart')

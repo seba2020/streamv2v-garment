@@ -17,6 +17,7 @@ class Args(NamedTuple):
     debug: bool
     acceleration: str
     engine_dir: str
+    garment_mode: bool
 
     def pretty_print(self):
         print("\n")
@@ -103,6 +104,13 @@ parser.add_argument(
     type=str,
     default=ENGINE_DIR,
     help="Engine Dir",
+)
+parser.add_argument(
+    "--garment-mode",
+    dest="garment_mode",
+    action="store_true",
+    default=os.environ.get("GARMENT_MODE", "False") == "True",
+    help="Enable IP-Adapter garment conditioning + clothing-mask blending (Phase 1)",
 )
 parser.set_defaults(taesd=USE_TAESD)
 config = Args(**vars(parser.parse_args()))
