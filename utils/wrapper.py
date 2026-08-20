@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 from pathlib import Path
 import traceback
 import logging
@@ -563,11 +564,19 @@ class StreamV2VWrapper:
 
         try:
             # Attempt to load the model from a local directory
-            pipe = pipeline_cls.from_pretrained(model_id_or_path).to(device=self.device, dtype=self.dtype)
+            # safety_checker is skipped here regardless of use_safety_checker:
+            # the wrapper loads its own instance separately below when needed,
+            # so the pipeline's copy is dead weight (and a source of loader
+            # incompatibilities across transformers versions).
+            pipe = pipeline_cls.from_pretrained(
+                model_id_or_path, safety_checker=None, requires_safety_checker=False
+            ).to(device=self.device, dtype=self.dtype)
         except ValueError:
             # If the model is not found locally, load from Hugging Face
             try:
-                pipe = pipeline_cls.from_single_file(model_id_or_path).to(device=self.device, dtype=self.dtype)
+                pipe = pipeline_cls.from_single_file(
+                    model_id_or_path, safety_checker=None, requires_safety_checker=False
+                ).to(device=self.device, dtype=self.dtype)
             except Exception as e:
                 logging.error(f"Failed to load model from Hugging Face: {e}")
                 sys.exit("Model load has failed from both local and Hugging Face sources.")
