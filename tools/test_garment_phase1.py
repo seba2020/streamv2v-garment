@@ -29,17 +29,23 @@ def main():
     parser.add_argument("--ip-adapter-scale", type=float, default=0.6)
     parser.add_argument("--acceleration", default="xformers", choices=["none", "xformers"])
     parser.add_argument(
+        "--t-index-list",
+        default="30,35,40,45",
+        help="Comma-separated LCM step indices (lower = more noise = stronger transformation)",
+    )
+    parser.add_argument(
         "--num-frames",
         type=int,
         default=6,
         help="Feed the same image N times (StreamV2V's temporal feature bank settles after a few frames)",
     )
     args = parser.parse_args()
+    t_index_list = [int(x) for x in args.t_index_list.split(",")]
 
     print("Loading model (first run also downloads IP-Adapter + segmentation weights)...")
     wrapper = StreamV2VWrapper(
         model_id_or_path=args.model,
-        t_index_list=[30, 35, 40, 45],
+        t_index_list=t_index_list,
         mode="img2img",
         width=512,
         height=512,
