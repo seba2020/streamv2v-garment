@@ -18,6 +18,9 @@ _deps = [
     "protobuf==3.20.2",
     "colored",
     "einops",
+    "polygraphy",
+    "onnx-graphsurgeon",
+    "tensorrt==10.9.0.34",
     # "pywin32;sys_platform == 'win32'"
 ]
 
