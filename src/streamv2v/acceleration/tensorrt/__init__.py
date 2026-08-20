@@ -1,19 +1,27 @@
+from __future__ import annotations
+
 import gc
 import os
 
 import torch
-from typing import List
+from typing import List, TYPE_CHECKING
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
     retrieve_latents,
 )
-from polygraphy import cuda
 
 from ...pipeline import StreamV2V
-from .builder import EngineBuilder, create_onnx_path
-from .engine import AutoencoderKLEngine, UNet2DConditionModelEngine
-from .models import VAE, BaseModel, UNet, VAEEncoder
 from ...models.utils import convert_structure_to_list, convert_list_to_structure
+
+# The TensorRT/polygraphy stack below is only needed for
+# acceleration="tensorrt"; importing it eagerly here would make it a hard
+# dependency just to use UNet2DConditionModelV2V/TorchVAEEncoder, which
+# every acceleration mode relies on. Deferred into the functions that
+# actually need it instead.
+if TYPE_CHECKING:
+    from .builder import EngineBuilder, create_onnx_path
+    from .engine import AutoencoderKLEngine, UNet2DConditionModelEngine
+    from .models import VAE, BaseModel, UNet, VAEEncoder
 
 class UNet2DConditionModelV2V(torch.nn.Module):
     def __init__(self, unet: UNet2DConditionModel, kvo_cache_structure = []):
@@ -47,6 +55,8 @@ def compile_vae_encoder(
     opt_batch_size: int = 1,
     engine_build_options: dict = {},
 ):
+    from .builder import EngineBuilder
+
     builder = EngineBuilder(model_data, vae, device=torch.device("cuda"))
     builder.build(
         onnx_path,
@@ -66,6 +76,8 @@ def compile_vae_decoder(
     opt_batch_size: int = 1,
     engine_build_options: dict = {},
 ):
+    from .builder import EngineBuilder
+
     vae = vae.to(torch.device("cuda"))
     builder = EngineBuilder(model_data, vae, device=torch.device("cuda"))
     builder.build(
@@ -86,6 +98,8 @@ def compile_unet(
     opt_batch_size: int = 1,
     engine_build_options: dict = {},
 ):
+    from .builder import EngineBuilder
+
     unet = unet.to(torch.device("cuda"), dtype=torch.float16)
     builder = EngineBuilder(model_data, unet, device=torch.device("cuda"))
     builder.build(
@@ -105,6 +119,11 @@ def accelerate_with_tensorrt(
     use_cuda_graph: bool = False,
     engine_build_options: dict = {},
 ):
+    from polygraphy import cuda
+    from .builder import create_onnx_path
+    from .engine import AutoencoderKLEngine, UNet2DConditionModelEngine
+    from .models import VAE, UNet, VAEEncoder
+
     if "opt_batch_size" not in engine_build_options or engine_build_options["opt_batch_size"] is None:
         engine_build_options["opt_batch_size"] = max_batch_size
     text_encoder = stream.text_encoder
