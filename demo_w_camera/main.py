@@ -175,6 +175,7 @@ class App:
                     "input_params": input_params,
                     "max_queue_size": self.args.max_queue_size,
                     "page_content": page_content if info.page_content else "",
+                    "garment_mode": self.args.garment_mode,
                 }
             )
 

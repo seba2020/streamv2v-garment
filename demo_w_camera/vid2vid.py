@@ -80,9 +80,15 @@ class Pipeline:
     def __init__(self, args: Args, device: torch.device, torch_dtype: torch.dtype):
         params = self.InputParams()
 
+        # 4 steps is StreamV2V's usual style-transfer schedule -- structure-preserving
+        # by design, so it barely changes the garment region. 8 steps (validated in
+        # Phase 1 testing) is what actually lets the IP-Adapter-conditioned garment
+        # show through, at roughly half the framerate.
+        t_index_list = [5, 12, 19, 26, 33, 40, 45, 49] if args.garment_mode else [30, 35, 40, 45]
+
         self.stream = StreamV2VWrapper(
             model_id_or_path=base_model,
-            t_index_list=[30, 35, 40, 45],
+            t_index_list=t_index_list,
             frame_buffer_size=1,
             width=params.width,
             height=params.height,
@@ -100,7 +106,9 @@ class Pipeline:
             use_tome_cache=True,
             seed=1,
             use_ip_adapter=args.garment_mode,
+            ip_adapter_scale=0.8,
             use_clothes_mask=args.garment_mode,
+            mask_update_interval=2,
         )
         self.garment_mode = args.garment_mode
         self._init_lora()

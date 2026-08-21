@@ -6,6 +6,7 @@
   import VideoInput from '$lib/components/VideoInput.svelte';
   import Button from '$lib/components/Button.svelte';
   import PipelineOptions from '$lib/components/PipelineOptions.svelte';
+  import GarmentPicker from '$lib/components/GarmentPicker.svelte';
   import Spinner from '$lib/icons/spinner.svelte';
   import Warning from '$lib/components/Warning.svelte';
   import { lcmLiveStatus, lcmLiveActions, LCMLiveStatus } from '$lib/lcmLive';
@@ -16,6 +17,7 @@
   let pipelineInfo: PipelineInfo;
   let pageContent: string;
   let isImageMode: boolean = false;
+  let garmentMode: boolean = false;
   let maxQueueSize: number = 0;
   let currentQueueSize: number = 0;
   let queueCheckerRunning: boolean = false;
@@ -29,6 +31,7 @@
     pipelineParams = settings.input_params.properties;
     pipelineInfo = settings.info.properties;
     isImageMode = pipelineInfo.input_mode.default === PipelineMode.IMAGE;
+    garmentMode = Boolean(settings.garment_mode);
     maxQueueSize = settings.max_queue_size;
     pageContent = settings.page_content;
     console.log(pipelineParams);
@@ -115,11 +118,14 @@
   {#if pipelineParams}
     <article class="my-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
       {#if isImageMode}
-        <div class="sm:col-start-1">
+        <div class="flex flex-col gap-3 sm:col-start-1">
           <VideoInput
             width={Number(pipelineParams.width.default)}
             height={Number(pipelineParams.height.default)}
           ></VideoInput>
+          {#if garmentMode}
+            <GarmentPicker />
+          {/if}
         </div>
       {/if}
       <div class={isImageMode ? 'sm:col-start-2' : 'col-span-2'}>
