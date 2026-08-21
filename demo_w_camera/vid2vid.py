@@ -111,7 +111,8 @@ class Pipeline:
             mask_update_interval=2,
         )
         self.garment_mode = args.garment_mode
-        self._init_lora()
+        if not self.garment_mode:
+            self._init_lora()
         self.last_prompt = default_prompt
         self.stream.prepare(
             prompt=default_prompt,
@@ -169,8 +170,8 @@ class Pipeline:
         return any(word in prompt for word in self.lora_trigger_words)
     
     def predict(self, params: "Pipeline.InputParams") -> Image.Image:
-        
-        if self._check_trigger_words(params.prompt):
+
+        if not self.garment_mode and self._check_trigger_words(params.prompt):
             if not self.lora_active:
                 self._activate_lora(params.prompt)
                 self.lora_active = True
